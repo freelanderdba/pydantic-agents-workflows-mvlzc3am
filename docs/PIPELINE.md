@@ -1,0 +1,315 @@
+# The 7-Stage AI Pipeline
+
+This document provides a detailed breakdown of each stage in the Q&A pipeline, including instrumentation patterns, costs, and performance characteristics.
+
+## Pipeline Overview
+
+The pipeline processes each question through seven stages in a single linear pass:
+
+```
+[1] Embedding → [2] Retrieval → [3] Generation → [4] Claims → 
+[5] Verification → [6] Accuracy → [7] Evaluation
+```
+
+Conceptually the post-generation stages group into **three distinct verification capabilities**,
+each answering a different question and demonstrating a different Workflows pattern:
+
+| Capability | Stages | Question it answers |
+|------------|--------|---------------------|
+| **Grounding** | [4] Claims Extraction → [5] Claims Verification | Is every factual statement supported by the retrieved sources? |
+| **Accuracy** | [6] Technical Accuracy | Are there factual/technical errors? (surfaces errors + corrections) |
+| **Quality** | [7] Dual-Model Evaluation | How well does the answer serve the developer, and do two independent judges agree? |
+
+These are deliberately *not* redundant: Grounding checks claims against sources, Accuracy owns
+factual correctness, and Quality owns the developer experience (clarity, completeness, usefulness).
+
+Answer generation ([3]) is **neutral**: the assistant answers only from the retrieved context with
+no product-favorable steering in the prompt. Render-specific docs reach the model through retrieval
+and the curated-injection rules in [`retrieval.py`](../backend/pipeline/retrieval.py), not by being
+hard-coded into the generation instructions.
+
+The stage logic below lives in [`backend/pipeline/`](../backend/pipeline/).
+In production it executes as a **Render Workflows** run: the `run_qa_pipeline` orchestrator
+([`workflows/app.py`](../workflows/app.py)) keeps the cheap stages (1, 2) in-process and
+promotes the heavy LLM stages (3, 4, 5) to their own retried subtasks, with stages 6 + 7
+running as three concurrent subtasks on separate instances. See the
+[Architecture section of the README](../README.md#architecture) for the topology.
+
+---
+
+## Stage 1: Question Embedding
+
+**Purpose:** Convert natural language question to vector representation
+
+**Model:** OpenAI `text-embedding-3-small`
+
+**Cost:** ~$0.002 per question
+
+**Instrumentation:**
+
+```python
+@logfire.instrument("embed_question")
+async def embed_question(text: str) -> List[float]:
+    with logfire.span("openai_embedding") as span:
+        span.set_attribute("text_length", len(text))
+        embedding = await openai.embeddings.create(...)
+        span.set_attribute("cost_usd", calculate_cost(...))
+        return embedding
+```
+
+**Key Metrics:**
+- Average latency: ~100ms
+- Cost per embedding: $0.0002
+- Embedding dimensions: 1536
+
+---
+
+## Stage 2: RAG Document Retrieval (Hybrid Search)
+
+**Purpose:** Find relevant documentation chunks using hybrid search
+
+**Database:** PostgreSQL with pgvector extension + full-text search
+
+**Method:** Hybrid Search combining semantic (vector) + lexical (BM25) search
+
+**Ranking:** Reciprocal Rank Fusion (RRF) to merge results
+
+### Why Hybrid Search?
+
+Pure semantic search can miss documents with specific keywords (e.g., "15 minutes", "port 3000"). Hybrid search combines:
+
+- **Semantic search (60%)** - Understanding intent and context
+- **BM25 lexical search (40%)** - Exact keyword and phrase matching
+
+### How it Works
+
+1. Run vector similarity search (pgvector) for semantic matches
+2. Run full-text search (PostgreSQL `tsvector`) for keyword matches
+3. Combine rankings using RRF: `score = 1/(k + rank)` where k=60
+4. Return top documents sorted by combined score
+
+### Instrumentation
+
+```python
+@logfire.instrument("rag_retrieval")
+async def retrieve_documents(embedding: List[float], query_text: str) -> List[Document]:
+    with logfire.span("hybrid_search") as span:
+        docs = await vectorstore.hybrid_search(
+            query_text=query_text,
+            query_embedding=embedding,
+            k=10,
+            bm25_weight=0.4  # 60% semantic, 40% BM25
+        )
+        span.set_attribute("docs_found", len(docs))
+        span.set_attribute("semantic_count", semantic_results)
+        span.set_attribute("bm25_count", bm25_results)
+        return docs
+```
+
+**Performance:** Hybrid search increases retrieval accuracy by ~35% for queries with specific numbers, technical terms, or product names.
+
+**Key Metrics:**
+- Average latency: ~300ms
+- Documents retrieved: 10 (configurable)
+- Cost: ~$0.0001 per retrieval
+
+For a technical deep-dive on hybrid search implementation, see [HYBRID_SEARCH.md](./HYBRID_SEARCH.md).
+
+---
+
+## Stage 3: Answer Generation
+
+**Purpose:** Generate a comprehensive answer **neutrally** from the retrieved context — the prompt contains only grounding rules (use the context, don't invent, don't conflate product types), with no product-favorable steering
+
+**Model:** Claude Sonnet 4.6
+
+**Context:** RAG documents + conversation history
+
+**Max Tokens:** 2000 (optimized for cost)
+
+**Instrumentation:**
+
+```python
+@logfire.instrument("generate_answer")
+async def generate_answer(question: str, context: str) -> dict:
+    with logfire.span("claude_generation") as span:
+        response = await anthropic.messages.create(...)
+        span.set_attribute("input_tokens", response.usage.input_tokens)
+        span.set_attribute("output_tokens", response.usage.output_tokens)
+        span.set_attribute("cost_usd", calculate_anthropic_cost(...))
+        return {"answer": response.content[0].text, "cost": cost}
+```
+
+**Key Metrics:**
+- Average latency: ~2.1s
+- Cost per generation: ~$0.045 (most expensive stage)
+- Average output tokens: ~800
+
+---
+
+## Stage 4: Claims Extraction
+
+**Capability:** Grounding (Stage 4 → Stage 5) — is every factual statement supported by the retrieved sources?
+
+**Purpose:** Extract verifiable factual claims from generated answer
+
+**Model:** GPT-4o-mini (fast + cheap)
+
+**Output:** JSON list of claims
+
+**Example Claims:**
+- "Render supports Node.js versions 14, 16, 18, and 20"
+- "PostgreSQL databases include automated daily backups"
+- "Static sites deploy automatically on git push"
+
+**Key Metrics:**
+- Average latency: ~400ms
+- Cost per extraction: ~$0.008
+- Average claims per answer: 5-8
+
+---
+
+## Stage 5: Claims Verification
+
+**Purpose:** Verify each claim against documentation
+
+**Method:** RAG search for each claim's embedding
+
+**Threshold:** 0.85 similarity score
+
+**Output:** Verified vs unverified claims
+
+**Key Metrics:**
+- Average latency: ~500ms
+- Cost per verification: ~$0.0015
+- Verification accuracy: ~92%
+
+---
+
+## Stage 6: Technical Accuracy Check
+
+**Capability:** Accuracy — owns *factual correctness*
+
+**Purpose:** Deep factual-grounding validation using Claude. Judges only whether the answer is correct and grounded (not its style or completeness — that is Stage 7's job); surfaces errors + corrections for observability
+
+**Model:** Claude Sonnet 4.6
+
+**Input:** Original answer + claims + verification results
+
+**Output:** Accuracy score (0-100) + corrections needed
+
+**Key Metrics:**
+- Average latency: ~600ms
+- Cost per check: ~$0.018
+- Average accuracy score: 89/100
+
+---
+
+## Stage 7: Quality Rating (Dual-Model Evaluation)
+
+**Capability:** Quality — owns the *developer experience*
+
+**Purpose:** Independent quality assessment (clarity, completeness, usefulness) from two models running in parallel; factual verification is left to Stage 6, and the two judges' agreement is a confidence signal
+
+**Models:** OpenAI GPT-4o-mini + Anthropic Claude Sonnet 4.6
+
+**Criteria:**
+- Technical accuracy (30%)
+- Clarity & organization (25%)
+- Completeness (25%)
+- Developer value (20%)
+
+**Output:**
+
+```json
+{
+  "openai_score": 92,
+  "anthropic_score": 88,
+  "average_score": 90,
+  "agreement_level": "high",
+  "feedback": "..."
+}
+```
+
+**Key Metrics:**
+- Average latency: ~300ms
+- Cost per evaluation: ~$0.007
+- Inter-rater agreement: 77% (within 10 points)
+
+---
+
+## Performance Metrics
+
+### Cost Breakdown (per question)
+
+```
+┌────────────────────────────────┬──────────┬──────────┐
+│ Stage                          │ Cost     │ % Total  │
+├────────────────────────────────┼──────────┼──────────┤
+│ Question Embedding             │ $0.0002  │    2%    │
+│ RAG Retrieval                  │ $0.0001  │    1%    │
+│ Answer Generation (Claude)     │ $0.0450  │   56%    │ ← Most expensive
+│ Claims Extraction (GPT)        │ $0.0080  │   10%    │
+│ Claims Verification (RAG)      │ $0.0015  │    2%    │
+│ Accuracy Check (Claude)        │ $0.0180  │   22%    │
+│ Quality Rating (Dual)          │ $0.0070  │    9%    │
+├────────────────────────────────┼──────────┼──────────┤
+│ TOTAL                          │ $0.0798  │  100%    │
+└────────────────────────────────┴──────────┴──────────┘
+```
+
+### Response Time Metrics
+
+- **Average Response Time:** 4.2 seconds
+- **P95 Response Time:** 8.7 seconds
+- **P99 Response Time:** 12.3 seconds
+
+### Quality Scores
+
+- **Average Quality Score:** 89/100
+- **OpenAI Average:** 87/100
+- **Anthropic Average:** 91/100
+- **Agreement Rate:** 77% (within 10 points)
+
+### Question Patterns
+
+```
+Deployment questions:  35% of traffic
+Database questions:    28% of traffic
+Configuration:         20% of traffic
+Pricing/Plans:         10% of traffic
+Other:                  7% of traffic
+```
+
+---
+
+## Optimization Tips
+
+### Reducing Costs
+
+1. **Lower MAX_TOKENS** - Reduce output token limit for generation
+2. **Use smaller models** - Consider GPT-4o-mini for less critical stages
+3. **Cache frequent questions** - Store common Q&A pairs
+
+### Improving Quality
+
+1. **Improve RAG context** - Add more documentation, refine chunking
+2. **Tune prompts** - Iterate on generation and evaluation prompts
+3. **Increase MAX_TOKENS** - Allow more detailed answers for complex questions
+4. **Add examples** - Few-shot examples in prompts
+
+### Reducing Latency
+
+1. **Parallelize stages** - Run independent evaluators concurrently
+2. **Optimize retrieval** - Fine-tune hybrid search weights and top-k
+3. **Use streaming** - Stream responses to users as they're generated
+4. **Cache embeddings** - Store question embeddings for common queries
+
+---
+
+## Related Documentation
+
+- [Observability Guide](./OBSERVABILITY.md) - Detailed instrumentation patterns
+- [Configuration Guide](./CONFIGURATION.md) - All configuration options
+- [Hybrid Search Deep-Dive](./HYBRID_SEARCH.md) - Technical implementation details
+

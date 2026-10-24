@@ -1,0 +1,230 @@
+"""Logfire configuration and instrumentation."""
+
+import logfire
+from logfire import LogfireSpan
+from typing import Any, Callable, TypeVar
+try:
+    from typing import ParamSpec
+except ImportError:
+    from typing_extensions import ParamSpec
+from functools import wraps
+import time
+from contextlib import asynccontextmanager
+
+from backend.config import settings
+
+# Configure Logfire
+logfire.configure(
+    token=settings.logfire_token,
+    service_name="render-qa-assistant",
+    environment=settings.environment,
+)
+
+# Auto-instrument libraries globally
+logfire.instrument_openai()       # Instruments direct OpenAI clients (embeddings.py)
+logfire.instrument_pydantic_ai()  # Instruments pydantic-ai agents (all LLM pipeline stages)
+logfire.instrument_asyncpg()      # Database queries
+logfire.instrument_httpx()        # HTTP client requests
+logfire.instrument_system_metrics()  # System metrics (CPU, memory, swap)
+# Note: FastAPI instrumentation is done in main.py after app creation
+
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+
+def _record_stage_success(span: LogfireSpan, start_time: float, result: Any) -> None:
+    """Record duration/success on the span, plus cost + token attrs when the stage
+    returned a dict carrying them."""
+    span.set_attribute("duration_ms", (time.time() - start_time) * 1000)
+    span.set_attribute("success", True)
+    if isinstance(result, dict):
+        if "cost_usd" in result:
+            span.set_attribute("cost_usd", result["cost_usd"])
+        if "input_tokens" in result:
+            span.set_attribute("input_tokens", result["input_tokens"])
+        if "output_tokens" in result:
+            span.set_attribute("output_tokens", result["output_tokens"])
+
+
+def _record_stage_failure(span: LogfireSpan, start_time: float, stage_name: str, exc: Exception) -> None:
+    """Record failure attributes on the span and log the error."""
+    span.set_attribute("duration_ms", (time.time() - start_time) * 1000)
+    span.set_attribute("success", False)
+    span.set_attribute("error", str(exc))
+    logfire.error(f"Stage {stage_name} failed: {exc}")
+
+
+def instrument_stage(stage_name: str):
+    """Decorator to instrument a pipeline stage with Logfire.
+
+    Picks an async or sync wrapper based on the wrapped function; both share the
+    same span lifecycle via _record_stage_success / _record_stage_failure, so the
+    only difference between them is the await.
+    """
+    import inspect
+
+    def decorator(func: Callable[P, R]) -> Callable[P, R]:
+        @wraps(func)
+        async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            with logfire.span(stage_name) as span:
+                span.set_attribute("span_type", "pipeline_stage")
+                start_time = time.time()
+                try:
+                    result = await func(*args, **kwargs)
+                    _record_stage_success(span, start_time, result)
+                    return result
+                except Exception as e:
+                    _record_stage_failure(span, start_time, stage_name, e)
+                    raise
+
+        @wraps(func)
+        def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            with logfire.span(stage_name) as span:
+                span.set_attribute("span_type", "pipeline_stage")
+                start_time = time.time()
+                try:
+                    result = func(*args, **kwargs)
+                    _record_stage_success(span, start_time, result)
+                    return result
+                except Exception as e:
+                    _record_stage_failure(span, start_time, stage_name, e)
+                    raise
+
+        return async_wrapper if inspect.iscoroutinefunction(func) else sync_wrapper  # type: ignore
+
+    return decorator
+
+
+@asynccontextmanager
+async def pipeline_trace(question: str):
+    """Context manager for tracing an entire pipeline execution."""
+    
+    with logfire.span(
+        "qa_pipeline",
+        question=question
+    ) as span:
+        span.set_attribute("span_type", "pipeline")
+        start_time = time.time()
+        pipeline_context = {
+            "span": span,
+            "start_time": start_time,
+            "total_cost": 0.0,
+            "stages": []
+        }
+        
+        try:
+            yield pipeline_context
+            
+            duration_ms = (time.time() - start_time) * 1000
+            span.set_attribute("duration_ms", duration_ms)
+            span.set_attribute("total_cost_usd", pipeline_context["total_cost"])
+            span.set_attribute("success", True)
+            
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            span.set_attribute("duration_ms", duration_ms)
+            span.set_attribute("success", False)
+            span.set_attribute("error", str(e))
+            logfire.error(f"Pipeline failed: {e}")
+            raise
+
+
+def calculate_embedding_cost(tokens: int) -> float:
+    """Calculate cost for embedding API calls."""
+    from backend.prices import model_cost
+    from backend.config import settings
+    return model_cost(tokens, 0, settings.embedding_model, "openai")
+
+
+def calculate_openai_cost(input_tokens: int, output_tokens: int, model: str) -> float:
+    """Calculate cost for OpenAI API calls."""
+    from backend.prices import model_cost
+    return model_cost(input_tokens, output_tokens, model, "openai")
+
+
+def calculate_anthropic_cost(input_tokens: int, output_tokens: int, model: str) -> float:
+    """Calculate cost for Anthropic API calls."""
+    from backend.prices import model_cost
+    return model_cost(input_tokens, output_tokens, model, "anthropic")
+
+
+def usage_and_cost(result, cost_fn, model: str) -> dict:
+    """Extract token usage from a pydantic-ai run result and compute its cost.
+
+    Centralizes the request/response-token extraction (with the ``or 0`` guard)
+    plus the cost calculation that every LLM pipeline stage repeats. ``cost_fn``
+    is one of ``calculate_openai_cost`` / ``calculate_anthropic_cost``.
+
+    Returns a dict with ``input_tokens``, ``output_tokens``, ``cost_usd``.
+    """
+    usage = result.usage()
+    input_tokens = usage.request_tokens or 0
+    output_tokens = usage.response_tokens or 0
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_fn(input_tokens, output_tokens, model),
+    }
+
+
+def track_pipeline_metrics(
+    question: str,
+    total_cost: float,
+    total_duration_ms: float,
+    quality_score: float,
+    accuracy_score: float,
+    session_id: str = None
+):
+    """
+    Track custom business metrics for the pipeline execution.
+
+    These metrics enable analysis of:
+    - Cost trends and optimization opportunities
+    - Quality score distributions
+    - Performance characteristics
+    """
+
+    # Track total cost per request
+    logfire.metric_histogram("pipeline.cost.total", unit="USD").record(
+        total_cost,
+        attributes={
+            "session_id": session_id or "unknown",
+        },
+    )
+
+    # Track pipeline duration
+    logfire.metric_histogram("pipeline.duration", unit="ms").record(
+        total_duration_ms,
+        attributes={
+            "session_id": session_id or "unknown",
+        },
+    )
+
+    # Track quality score distribution
+    logfire.metric_histogram("pipeline.quality_score", unit="score").record(
+        quality_score,
+        attributes={
+            "session_id": session_id or "unknown",
+        },
+    )
+
+    # Track accuracy score
+    logfire.metric_histogram("pipeline.accuracy_score", unit="score").record(
+        accuracy_score,
+        attributes={
+            "session_id": session_id or "unknown",
+        },
+    )
+
+    # Log structured event for queryability
+    logfire.info(
+        "Pipeline execution completed",
+        question_length=len(question),
+        total_cost_usd=total_cost,
+        duration_ms=total_duration_ms,
+        quality_score=quality_score,
+        accuracy_score=accuracy_score,
+        session_id=session_id or "unknown",
+    )
+
